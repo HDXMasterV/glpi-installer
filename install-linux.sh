@@ -263,22 +263,25 @@ instalar_deb() {
 
     # Detener unattended-upgrades ANTES de cualquier operación dpkg.
     info "Deteniendo actualizaciones automáticas para liberar dpkg..."
-    systemctl stop unattended-upgrades 2>/dev/null || true
-    systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-    systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 
-    # Matar directamente cualquier proceso que tenga el lock tomado
+    # Matar directamente por PID sin esperar graceful shutdown (evita colgarse)
+    for proc in unattended-upgr apt-get dpkg; do
+        pkill -9 -f "${proc}" 2>/dev/null || true
+    done
+    timeout 5 systemctl stop unattended-upgrades 2>/dev/null || true
+    timeout 5 systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+
+    # Matar cualquier proceso que aún tenga algún lock tomado
     for lock_file in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
         if [[ -f "${lock_file}" ]]; then
             local pid
             pid=$(fuser "${lock_file}" 2>/dev/null || true)
             if [[ -n "${pid}" ]]; then
-                warn "Proceso ${pid} tiene el lock ${lock_file}. Terminando..."
                 kill -9 "${pid}" 2>/dev/null || true
-                sleep 2
             fi
         fi
     done
+    sleep 2
 
     # Eliminar los archivos de lock directamente
     rm -f /var/lib/dpkg/lock-frontend \
