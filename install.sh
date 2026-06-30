@@ -26,7 +26,75 @@ info()      { echo -e "${BLUE}[INFO]${NC}  $1"; }
 ok()        { echo -e "${GREEN}[OK]${NC}    $1"; }
 warn()      { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error()     { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+error_no_exit() { echo -e "${RED}[ERROR]${NC} $1"; }
 separador() { echo -e "${BLUE}────────────────────────────────────────────${NC}"; }
+
+# =============================================================================
+# VERIFICACIÓN DE PUERTO 80 (servidor GLPI)
+# =============================================================================
+verificar_puerto_80() {
+    separador
+    info "Verificando acceso al puerto 80 del servidor GLPI..."
+
+    local host="glpi-service.mundopacifico.cl"
+
+    # Probamos conexión directa al puerto 80 usando /dev/tcp (bash puro, sin dependencias)
+    if timeout 5 bash -c "exec 3<>/dev/tcp/${host}/80" 2>/dev/null; then
+        exec 3>&- 2>/dev/null || true
+        exec 3<&- 2>/dev/null || true
+        ok "Puerto 80 accesible hacia ${host}."
+        return 0
+    else
+        warn "El puerto 80 hacia ${host} está bloqueado o inaccesible."
+        return 1
+    fi
+}
+
+# =============================================================================
+# LIMPIEZA / DESINSTALACIÓN EN CASO DE FALLO POR PUERTO 80
+# =============================================================================
+limpiar_por_puerto_bloqueado() {
+    separador
+    error_no_exit "PUERTO 80 BLOQUEADO: no es posible contactar a ${GLPI_SERVER}"
+    warn "Esto generalmente se debe a un firewall corporativo o reglas de red que bloquean el puerto 80 (HTTP)."
+    warn "Se procederá a eliminar cualquier rastro de instalación para dejar el equipo limpio."
+
+    info "Deteniendo servicio glpi-agent (si existe)..."
+    systemctl stop glpi-agent 2>/dev/null || true
+    systemctl disable glpi-agent 2>/dev/null || true
+
+    info "Eliminando paquete glpi-agent (si fue instalado)..."
+    if command -v apt-get &>/dev/null; then
+        apt-get remove -y --purge glpi-agent 2>/dev/null || true
+    fi
+    if command -v yum &>/dev/null; then
+        yum remove -y glpi-agent 2>/dev/null || true
+    fi
+    if command -v dnf &>/dev/null; then
+        dnf remove -y glpi-agent 2>/dev/null || true
+    fi
+
+    info "Eliminando archivos de configuración y binarios residuales..."
+    rm -rf /etc/glpi-agent
+    rm -rf /var/lib/glpi-agent
+    rm -rf /opt/glpi-agent
+    rm -f /usr/local/bin/glpi-agent
+
+    info "Eliminando archivos temporales de instalación..."
+    rm -rf "${TMP_DIR}"
+
+    separador
+    echo -e "${RED}"
+    echo "  ╔══════════════════════════════════════════════╗"
+    echo "  ║   INSTALACIÓN ABORTADA: PUERTO 80 BLOQUEADO   ║"
+    echo "  ╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo -e "  Solicita a la persona encargada de redes que habilite salida"
+    echo -e "  HTTP (puerto 80) hacia ${BLUE}glpi-service.mundopacifico.cl${NC} y vuelve a ejecutar el script."
+    separador
+
+    exit 1
+}
 
 # =============================================================================
 # DETECCIÓN DEL SISTEMA
@@ -197,6 +265,8 @@ ok "Conexión a internet verificada."
 # =============================================================================
 # FLUJO PRINCIPAL
 # =============================================================================
+verificar_puerto_80 || limpiar_por_puerto_bloqueado
+
 detectar_sistema
 elegir_metodo
 
@@ -240,8 +310,14 @@ fi
 # Enviar inventario
 separador
 info "Enviando inventario inicial al servidor..."
-glpi-agent --server "${GLPI_SERVER}" --runnow && ok "Inventario enviado." \
-    || warn "Hubo advertencias al enviar el inventario. Revisa los logs."
+if glpi-agent --server "${GLPI_SERVER}" --set-forcerun; then
+    systemctl restart glpi-agent 2>/dev/null || true
+    ok "Inventario forzado y servicio reiniciado para ejecutarlo de inmediato."
+else
+    warn "Falló el envío del inventario. Verificando si el puerto 80 sigue accesible..."
+    verificar_puerto_80 || limpiar_por_puerto_bloqueado
+    warn "El puerto 80 está accesible, pero hubo otra advertencia al enviar el inventario. Revisa los logs."
+fi
 
 # =============================================================================
 # RESUMEN FINAL
@@ -261,7 +337,7 @@ echo ""
 echo -e "  Comandos útiles:"
 echo -e "  ${YELLOW}systemctl status glpi-agent${NC}     → Estado del servicio"
 echo -e "  ${YELLOW}systemctl restart glpi-agent${NC}    → Reiniciar el agente"
-echo -e "  ${YELLOW}glpi-agent --runnow${NC}             → Forzar inventario manual"
+echo -e "  ${YELLOW}glpi-agent --set-forcerun${NC}       → Forzar inventario en próximo arranque"
 echo -e "  ${YELLOW}journalctl -u glpi-agent -f${NC}     → Logs en tiempo real"
 separador
 
