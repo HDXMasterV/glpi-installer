@@ -269,6 +269,11 @@ instalar_deb() {
     ok "Paquete descargado."
 
     info "Instalando via apt-get (resuelve dependencias automáticamente)..."
+    # Preconfigurar debconf para evitar cualquier diálogo interactivo
+    # (como el de PAM preguntando si sobreescribir archivos locales)
+    echo 'libpam-runtime libpam-runtime/override boolean false' | debconf-set-selections 2>/dev/null || true
+    echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections 2>/dev/null || true
+
     if DEBIAN_FRONTEND=noninteractive apt-get install -y "${deb_file}" 2>&1 | tee "${install_log}"; then
         ok "Instalación via .deb completada."
     else
