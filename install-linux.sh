@@ -261,30 +261,38 @@ instalar_deb() {
     export DEBCONF_NONINTERACTIVE_SEEN=true
     export UCF_FORCE_CONFFOLD=1  # conservar archivos locales si hay conflicto
 
+    # Detener unattended-upgrades ANTES de cualquier operación dpkg.
+    info "Deteniendo actualizaciones automáticas para liberar dpkg..."
+    systemctl stop unattended-upgrades 2>/dev/null || true
+    systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+    systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+
+    # Matar directamente cualquier proceso que tenga el lock tomado
+    for lock_file in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
+        if [[ -f "${lock_file}" ]]; then
+            local pid
+            pid=$(fuser "${lock_file}" 2>/dev/null || true)
+            if [[ -n "${pid}" ]]; then
+                warn "Proceso ${pid} tiene el lock ${lock_file}. Terminando..."
+                kill -9 "${pid}" 2>/dev/null || true
+                sleep 2
+            fi
+        fi
+    done
+
+    # Eliminar los archivos de lock directamente
+    rm -f /var/lib/dpkg/lock-frontend \
+          /var/lib/dpkg/lock \
+          /var/cache/apt/archives/lock \
+          /var/cache/debconf/config.dat-old 2>/dev/null || true
+
+    ok "dpkg disponible."
+
     # Limpiar cualquier instalación previa conflictiva
     limpiar_instalacion_previa_conflictiva
 
     # Reparar posibles estados rotos de dpkg antes de instalar
     info "Verificando estado de dpkg..."
-
-    # Esperar a que unattended-upgrades u otro proceso libere el lock de dpkg
-    local intentos=0
-    local max_intentos=24  # máximo 2 minutos (24 x 5 segundos)
-    while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock &>/dev/null 2>&1; do
-        if [[ ${intentos} -eq 0 ]]; then
-            warn "dpkg está siendo usado por otro proceso (ej. actualizaciones automáticas). Esperando..."
-        fi
-        intentos=$((intentos + 1))
-        if [[ ${intentos} -ge ${max_intentos} ]]; then
-            warn "Tiempo de espera agotado. Forzando liberación del lock..."
-            systemctl stop unattended-upgrades 2>/dev/null || true
-            rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
-            break
-        fi
-        sleep 5
-    done
-    ok "dpkg disponible. Continuando..."
-
     dpkg --configure -a 2>/dev/null || true
     DEBIAN_FRONTEND=noninteractive apt-get install -f -y 2>/dev/null || true
 
