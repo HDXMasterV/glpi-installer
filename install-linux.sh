@@ -255,6 +255,12 @@ instalar_deb() {
     local deb_file="${TMP_DIR}/glpi-agent.deb"
     local url="${BASE_URL}/glpi-agent_${GLPI_VERSION}-1_all.deb"
 
+    # Forzar modo completamente silencioso: ningún paquete puede lanzar
+    # diálogos interactivos (como el de PAM), sin importar lo que pida.
+    export DEBIAN_FRONTEND=noninteractive
+    export DEBCONF_NONINTERACTIVE_SEEN=true
+    export UCF_FORCE_CONFFOLD=1  # conservar archivos locales si hay conflicto
+
     # Limpiar cualquier instalación previa conflictiva
     limpiar_instalacion_previa_conflictiva
 
@@ -280,8 +286,8 @@ instalar_deb() {
         echo ""
         warn "Instalación via apt-get falló. Intentando con dpkg + fix de dependencias..."
         separador
-        dpkg -i "${deb_file}" 2>&1 | tee -a "${install_log}" || true
-        apt-get install -f -y 2>&1 | tee -a "${install_log}" || true
+        DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true dpkg -i "${deb_file}" 2>&1 | tee -a "${install_log}" || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -f -y 2>&1 | tee -a "${install_log}" || true
         separador
 
         # Verificar si quedó instalado a pesar del error
