@@ -266,8 +266,27 @@ instalar_deb() {
 
     # Reparar posibles estados rotos de dpkg antes de instalar
     info "Verificando estado de dpkg..."
+
+    # Esperar a que unattended-upgrades u otro proceso libere el lock de dpkg
+    local intentos=0
+    local max_intentos=24  # máximo 2 minutos (24 x 5 segundos)
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock &>/dev/null 2>&1; do
+        if [[ ${intentos} -eq 0 ]]; then
+            warn "dpkg está siendo usado por otro proceso (ej. actualizaciones automáticas). Esperando..."
+        fi
+        intentos=$((intentos + 1))
+        if [[ ${intentos} -ge ${max_intentos} ]]; then
+            warn "Tiempo de espera agotado. Forzando liberación del lock..."
+            systemctl stop unattended-upgrades 2>/dev/null || true
+            rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+            break
+        fi
+        sleep 5
+    done
+    ok "dpkg disponible. Continuando..."
+
     dpkg --configure -a 2>/dev/null || true
-    apt-get install -f -y 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -f -y 2>/dev/null || true
 
     info "Descargando paquete .deb oficial de GLPI Agent..."
     curl -fL --progress-bar "${url}" -o "${deb_file}" \
