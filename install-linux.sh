@@ -207,6 +207,41 @@ instalar_appimage() {
 }
 
 # =============================================================================
+# LIMPIEZA DE INSTALACIONES PREVIAS CONFLICTIVAS
+# =============================================================================
+# Algunos equipos tienen glpi-agent instalado desde el repositorio genérico
+# de la distro (ej. Ubuntu universe, versión 1.4 u otra antigua), lo que
+# choca con el instalador oficial 1.17 y hace fallar la instalación con un
+# mensaje genérico "Failed to install glpi-agent".
+limpiar_instalacion_previa_conflictiva() {
+    local version_instalada=""
+
+    if [[ "${OS_FAMILY}" == "deb" ]] && command -v dpkg &>/dev/null; then
+        version_instalada=$(dpkg -l 2>/dev/null | awk '/^ii[[:space:]]+glpi-agent[[:space:]]/ {print $3}')
+    elif [[ "${OS_FAMILY}" == "rpm" ]] && command -v rpm &>/dev/null; then
+        version_instalada=$(rpm -q --qf '%{VERSION}' glpi-agent 2>/dev/null || true)
+    fi
+
+    if [[ -n "${version_instalada}" ]]; then
+        warn "Se detectó una instalación previa de glpi-agent (versión: ${version_instalada}), distinta a la oficial ${GLPI_VERSION}."
+        warn "Esto suele venir del repositorio estándar de la distro y choca con el instalador oficial. Purgando..."
+
+        systemctl stop glpi-agent 2>/dev/null || true
+
+        if [[ "${OS_FAMILY}" == "deb" ]]; then
+            apt-get remove --purge -y glpi-agent 2>/dev/null || true
+            apt-get autoremove -y 2>/dev/null || true
+        elif [[ "${OS_FAMILY}" == "rpm" ]]; then
+            yum remove -y glpi-agent 2>/dev/null || dnf remove -y glpi-agent 2>/dev/null || true
+        fi
+
+        rm -rf /etc/glpi-agent /var/lib/glpi-agent
+
+        ok "Instalación previa eliminada. Continuando con la instalación oficial ${GLPI_VERSION}."
+    fi
+}
+
+# =============================================================================
 # INSTALACIÓN VIA INSTALADOR PERL (distros modernas DEB/RPM)
 # =============================================================================
 instalar_perl() {
@@ -221,6 +256,10 @@ instalar_perl() {
         fi
     fi
 
+    # Detectar instalación previa conflictiva (ej. paquete genérico de la distro,
+    # distinto al instalador oficial de GLPI), que hace fallar el instalador Perl.
+    limpiar_instalacion_previa_conflictiva
+
     info "Descargando instalador Perl oficial..."
     local url="${BASE_URL}/glpi-agent-${GLPI_VERSION}-linux-installer.pl"
     local dest="${TMP_DIR}/glpi-install.pl"
@@ -230,8 +269,20 @@ instalar_perl() {
 
     ok "Instalador descargado."
     info "Instalando via Perl (detecta DEB o RPM automáticamente)..."
-    perl "${dest}" --install --server "${GLPI_SERVER}" --runnow \
-        || error "Falló la instalación via Perl."
+
+    local install_log="${TMP_DIR}/perl-install.log"
+
+    if perl "${dest}" --install --server "${GLPI_SERVER}" --runnow 2>&1 | tee "${install_log}"; then
+        ok "Instalación via Perl completada."
+    else
+        echo ""
+        warn "La instalación via Perl falló. Detalle del error (últimas 20 líneas):"
+        separador
+        tail -n 20 "${install_log}" || true
+        separador
+        warn "Log completo disponible en: ${install_log} (no se eliminará para diagnóstico)"
+        error "Falló la instalación via Perl. Revisa el detalle de arriba."
+    fi
 }
 
 # =============================================================================

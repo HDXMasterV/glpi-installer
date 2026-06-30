@@ -129,9 +129,50 @@ function Detectar-Sistema {
 }
 
 # =============================================================================
+# LIMPIEZA DE INSTALACIONES PREVIAS CONFLICTIVAS
+# =============================================================================
+# Algunos equipos pueden tener GLPI-Agent instalado con una version distinta
+# a la oficial (ej. instalado manualmente, via otra herramienta, o una
+# version anterior con un MSI distinto), lo que puede hacer fallar la
+# instalacion silenciosa via msiexec con un error generico.
+function Limpiar-InstalacionPreviaConflictiva {
+    $productos = Get-CimInstance -ClassName Win32_Product -Filter "Name LIKE '%GLPI%Agent%'" -ErrorAction SilentlyContinue
+
+    if ($productos) {
+        foreach ($producto in $productos) {
+            if ($producto.Version -ne $GLPI_VERSION) {
+                Warn "Se detecto una instalacion previa de GLPI Agent (version: $($producto.Version)), distinta a la oficial $GLPI_VERSION."
+                Warn "Esto suele chocar con la instalacion silenciosa del MSI oficial. Desinstalando..."
+
+                Stop-Service -Name "GLPI-Agent" -ErrorAction SilentlyContinue
+
+                try {
+                    $resultado = $producto | Invoke-CimMethod -MethodName Uninstall
+                    if ($resultado.ReturnValue -ne 0) {
+                        Warn "Win32_Product.Uninstall devolvio codigo $($resultado.ReturnValue), continuando con limpieza manual."
+                    }
+                } catch {
+                    Warn "No se pudo desinstalar via WMI, continuando con limpieza manual: $_"
+                }
+
+                Remove-Item -Path "C:\Program Files\GLPI-Agent" -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path "C:\Program Files (x86)\GLPI-Agent" -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path "C:\ProgramData\GLPI-Agent" -Recurse -Force -ErrorAction SilentlyContinue
+
+                Ok "Instalacion previa eliminada. Continuando con la instalacion oficial $GLPI_VERSION."
+            } else {
+                Info "GLPI Agent $GLPI_VERSION ya se encuentra instalado y es la version correcta."
+            }
+        }
+    }
+}
+
+# =============================================================================
 # DESCARGA E INSTALACION VIA MSI
 # =============================================================================
 function Instalar-GlpiAgent {
+    Limpiar-InstalacionPreviaConflictiva
+
     Info "Descargando instalador MSI oficial de GLPI Agent..."
     $url = "$BASE_URL/$MSI_NAME"
 
@@ -154,7 +195,16 @@ function Instalar-GlpiAgent {
     $proceso = Start-Process -FilePath "msiexec.exe" -ArgumentList $argumentos -Wait -PassThru
 
     if ($proceso.ExitCode -ne 0) {
-        Salir-ConError "La instalacion via MSI fallo (codigo de salida: $($proceso.ExitCode)). Revisa el log: $LOG_PATH"
+        Warn "La instalacion via MSI fallo (codigo de salida: $($proceso.ExitCode)). Detalle del log (ultimas 20 lineas):"
+        Separador
+        if (Test-Path $LOG_PATH) {
+            Get-Content $LOG_PATH -Tail 20
+        } else {
+            Warn "No se genero archivo de log."
+        }
+        Separador
+        Warn "Log completo disponible en: $LOG_PATH (no se eliminara para diagnostico)"
+        Salir-ConError "Falla la instalacion via MSI. Revisa el detalle de arriba."
     }
 
     Ok "Instalacion via MSI completada."
