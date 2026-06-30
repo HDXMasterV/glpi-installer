@@ -174,9 +174,13 @@ elegir_metodo() {
     fi
 
     case "${OS_FAMILY}" in
-        deb|rpm)
-            info "Distro moderna con repositorios activos. Usando instalador Perl nativo."
-            METODO="perl"
+        deb)
+            info "Distro Debian/Ubuntu detectada. Usando paquete .deb oficial (apt-get)."
+            METODO="deb"
+            ;;
+        rpm)
+            info "Distro RPM detectada. Usando instalador Perl nativo."
+            METODO="rpm"
             ;;
         *)
             warn "Familia de distro desconocida. Usando AppImage como método seguro."
@@ -242,22 +246,71 @@ limpiar_instalacion_previa_conflictiva() {
 }
 
 # =============================================================================
-# INSTALACIÓN VIA INSTALADOR PERL (distros modernas DEB/RPM)
+# INSTALACIÓN VIA .DEB DIRECTO (Ubuntu/Debian)
+# Más confiable que el instalador Perl: apt-get resuelve dependencias
+# automáticamente y no tiene conflictos con paquetes previos del sistema.
 # =============================================================================
-instalar_perl() {
-    # Verificar que perl esté disponible
-    if ! command -v perl &>/dev/null; then
-        info "Perl no encontrado. Instalando..."
-        if [[ "${OS_FAMILY}" == "deb" ]]; then
-            apt-get install -y perl 2>/dev/null || error "No se pudo instalar Perl."
-        elif [[ "${OS_FAMILY}" == "rpm" ]]; then
-            yum install -y perl 2>/dev/null || dnf install -y perl 2>/dev/null \
-                || error "No se pudo instalar Perl."
+instalar_deb() {
+    local install_log="${TMP_DIR}/deb-install.log"
+    local deb_file="${TMP_DIR}/glpi-agent.deb"
+    local url="${BASE_URL}/glpi-agent_${GLPI_VERSION}-1_all.deb"
+
+    # Limpiar cualquier instalación previa conflictiva
+    limpiar_instalacion_previa_conflictiva
+
+    # Reparar posibles estados rotos de dpkg antes de instalar
+    info "Verificando estado de dpkg..."
+    dpkg --configure -a 2>/dev/null || true
+    apt-get install -f -y 2>/dev/null || true
+
+    info "Descargando paquete .deb oficial de GLPI Agent..."
+    curl -fL --progress-bar "${url}" -o "${deb_file}" \
+        || error "Falló la descarga del paquete .deb."
+    ok "Paquete descargado."
+
+    info "Instalando via apt-get (resuelve dependencias automáticamente)..."
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y "${deb_file}" 2>&1 | tee "${install_log}"; then
+        ok "Instalación via .deb completada."
+    else
+        echo ""
+        warn "Instalación via apt-get falló. Intentando con dpkg + fix de dependencias..."
+        separador
+        dpkg -i "${deb_file}" 2>&1 | tee -a "${install_log}" || true
+        apt-get install -f -y 2>&1 | tee -a "${install_log}" || true
+        separador
+
+        # Verificar si quedó instalado a pesar del error
+        if dpkg -l 2>/dev/null | grep -q "^ii[[:space:]]*glpi-agent"; then
+            ok "GLPI Agent instalado correctamente (via dpkg + fix de dependencias)."
+        else
+            warn "Detalle del error (últimas 20 líneas):"
+            separador
+            tail -n 20 "${install_log}" || true
+            separador
+            warn "Log completo disponible en: ${install_log} (no se eliminará para diagnóstico)"
+            error "Falló la instalación del paquete .deb. Revisa el detalle de arriba."
         fi
     fi
 
-    # Detectar instalación previa conflictiva (ej. paquete genérico de la distro,
-    # distinto al instalador oficial de GLPI), que hace fallar el instalador Perl.
+    # Aplicar configuración del servidor GLPI
+    info "Aplicando configuración del servidor GLPI..."
+    mkdir -p /etc/glpi-agent/conf.d
+    cat > /etc/glpi-agent/conf.d/00-install.cfg <<EOF
+server = ${GLPI_SERVER}
+EOF
+    ok "Configuración aplicada."
+}
+
+# =============================================================================
+# INSTALACIÓN VIA INSTALADOR PERL (solo para RPM: RHEL, CentOS, Rocky, etc.)
+# =============================================================================
+instalar_perl_rpm() {
+    if ! command -v perl &>/dev/null; then
+        info "Perl no encontrado. Instalando..."
+        yum install -y perl 2>/dev/null || dnf install -y perl 2>/dev/null \
+            || error "No se pudo instalar Perl."
+    fi
+
     limpiar_instalacion_previa_conflictiva
 
     info "Descargando instalador Perl oficial..."
@@ -268,14 +321,13 @@ instalar_perl() {
         || error "Falló la descarga del instalador Perl."
 
     ok "Instalador descargado."
-    info "Instalando via Perl (detecta DEB o RPM automáticamente)..."
+    info "Instalando via Perl (RPM)..."
 
     local install_log="${TMP_DIR}/perl-install.log"
 
     if perl "${dest}" --install --server "${GLPI_SERVER}" --runnow 2>&1 | tee "${install_log}"; then
         ok "Instalación via Perl completada."
     else
-        echo ""
         warn "La instalación via Perl falló. Detalle del error (últimas 20 líneas):"
         separador
         tail -n 20 "${install_log}" || true
@@ -326,7 +378,8 @@ info "Iniciando instalación (método: ${METODO})..."
 
 case "${METODO}" in
     appimage) instalar_appimage ;;
-    perl)     instalar_perl ;;
+    deb)      instalar_deb ;;
+    rpm)      instalar_perl_rpm ;;
     *)        error "Método de instalación desconocido." ;;
 esac
 
