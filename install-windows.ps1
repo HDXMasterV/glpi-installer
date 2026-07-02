@@ -1,14 +1,14 @@
 # =============================================================================
 # Script de instalacion de GLPI Agent v1.17 para Windows
-# Servidor: http://glpi-service.mundopacifico.cl/
+# Servidor: glpi-service.mundopacifico.cl (HTTPS preferido, HTTP fallback)
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
 
 # --- Variables ---
 $GLPI_VERSION = "1.17"
-$GLPI_SERVER  = "http://glpi-service.mundopacifico.cl/"
 $GLPI_HOST    = "glpi-service.mundopacifico.cl"
+$GLPI_SERVER  = ""   # se define automaticamente segun el puerto disponible (443 u 80)
 $BASE_URL     = "https://github.com/glpi-project/glpi-agent/releases/download/$GLPI_VERSION"
 $TMP_DIR      = "$env:TEMP\glpi-agent-install"
 $MSI_NAME     = "glpi-agent-$GLPI_VERSION-x64.msi"
@@ -39,39 +39,62 @@ function Verificar-Admin {
 }
 
 # =============================================================================
-# VERIFICACION DE PUERTO 80 (servidor GLPI)
+# VERIFICACION DE PUERTO (helper generico)
 # =============================================================================
-function Verificar-Puerto80 {
-    Separador
-    Info "Verificando acceso al puerto 80 del servidor GLPI..."
-
+function Puerto-Accesible($puerto) {
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
-        $connectTask = $tcp.ConnectAsync($GLPI_HOST, 80)
+        $connectTask = $tcp.ConnectAsync($GLPI_HOST, $puerto)
         $completed = $connectTask.Wait(5000)
 
         if ($completed -and $tcp.Connected) {
             $tcp.Close()
-            Ok "Puerto 80 accesible hacia $GLPI_HOST."
             return $true
         } else {
             $tcp.Close()
-            Warn "El puerto 80 hacia $GLPI_HOST esta bloqueado o inaccesible."
             return $false
         }
     } catch {
-        Warn "El puerto 80 hacia $GLPI_HOST esta bloqueado o inaccesible."
         return $false
     }
 }
 
 # =============================================================================
-# LIMPIEZA / DESINSTALACION EN CASO DE FALLO POR PUERTO 80
+# SELECCION AUTOMATICA DE PROTOCOLO: HTTPS (443) preferido, HTTP (80) fallback
+# =============================================================================
+function Seleccionar-Servidor {
+    Separador
+    Info "Verificando conectividad hacia el servidor GLPI ($GLPI_HOST)..."
+
+    if (Puerto-Accesible 443) {
+        $script:GLPI_SERVER = "https://$GLPI_HOST/"
+        Ok "Puerto 443 accesible. Se usara HTTPS: $($script:GLPI_SERVER)"
+        return $true
+    }
+    Warn "Puerto 443 no accesible. Probando puerto 80..."
+
+    if (Puerto-Accesible 80) {
+        $script:GLPI_SERVER = "http://$GLPI_HOST/"
+        Ok "Puerto 80 accesible. Se usara HTTP: $($script:GLPI_SERVER)"
+        return $true
+    }
+
+    Warn "Ningun puerto (443 ni 80) accesible hacia $GLPI_HOST."
+    return $false
+}
+
+# Verificacion reutilizable post-instalacion
+function Verificar-ConectividadGlpi {
+    return ((Puerto-Accesible 443) -or (Puerto-Accesible 80))
+}
+
+# =============================================================================
+# LIMPIEZA / DESINSTALACION EN CASO DE FALLO DE CONECTIVIDAD
 # =============================================================================
 function Limpiar-PorPuertoBloqueado {
     Separador
-    ErrorMsg "PUERTO 80 BLOQUEADO: no es posible contactar a $GLPI_SERVER"
-    Warn "Esto generalmente se debe a un firewall corporativo o reglas de red que bloquean el puerto 80 (HTTP)."
+    ErrorMsg "SIN CONECTIVIDAD: no es posible contactar a $GLPI_HOST ni por 443 (HTTPS) ni por 80 (HTTP)."
+    Warn "Esto generalmente se debe a un firewall corporativo o reglas de red."
     Warn "Se procedera a eliminar cualquier rastro de instalacion para dejar el equipo limpio."
 
     Info "Deteniendo servicio GLPI-Agent (si existe)..."
@@ -95,11 +118,11 @@ function Limpiar-PorPuertoBloqueado {
     Separador
     Write-Host ""
     Write-Host "  ╔══════════════════════════════════════════════╗" -ForegroundColor Red
-    Write-Host "  ║   INSTALACION ABORTADA: PUERTO 80 BLOQUEADO   ║" -ForegroundColor Red
+    Write-Host "  ║  INSTALACION ABORTADA: SIN CONECTIVIDAD GLPI  ║" -ForegroundColor Red
     Write-Host "  ╚══════════════════════════════════════════════╝" -ForegroundColor Red
     Write-Host ""
     Write-Host "  Solicita a la persona encargada de redes que habilite salida"
-    Write-Host "  HTTP (puerto 80) hacia " -NoNewline
+    Write-Host "  HTTPS (443) o HTTP (80) hacia " -NoNewline
     Write-Host "$GLPI_HOST" -ForegroundColor Cyan -NoNewline
     Write-Host " y vuelve a ejecutar el script."
     Separador
@@ -237,8 +260,8 @@ try {
     Salir-ConError "Sin acceso a internet. Verifica la conexion."
 }
 
-# Verificacion de puerto 80 (antes de instalar, igual que en la version Linux)
-if (-not (Verificar-Puerto80)) {
+# Seleccion automatica de protocolo (igual que en la version Linux)
+if (-not (Seleccionar-Servidor)) {
     Limpiar-PorPuertoBloqueado
 }
 
@@ -292,11 +315,11 @@ if (Test-Path $glpiAgentExe) {
         Restart-Service -Name "GLPI-Agent" -ErrorAction SilentlyContinue
         Ok "Inventario forzado y servicio reiniciado para ejecutarlo de inmediato."
     } catch {
-        Warn "Fallo el envio del inventario. Verificando si el puerto 80 sigue accesible..."
-        if (-not (Verificar-Puerto80)) {
+        Warn "Fallo el envio del inventario. Verificando si el servidor sigue accesible..."
+        if (-not (Verificar-ConectividadGlpi)) {
             Limpiar-PorPuertoBloqueado
         } else {
-            Warn "El puerto 80 esta accesible, pero hubo otra advertencia al enviar el inventario. Revisa el log: $LOG_PATH"
+            Warn "El servidor esta accesible, pero hubo otra advertencia al enviar el inventario. Revisa el log: $LOG_PATH"
         }
     }
 } else {

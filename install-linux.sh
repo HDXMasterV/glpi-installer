@@ -16,7 +16,8 @@ NC='\033[0m'
 
 # --- Variables ---
 GLPI_VERSION="1.17"
-GLPI_SERVER="http://glpi-service.mundopacifico.cl/"
+GLPI_HOST="glpi-service.mundopacifico.cl"
+GLPI_SERVER=""   # se define automáticamente según el puerto disponible (443 u 80)
 BASE_URL="https://github.com/glpi-project/glpi-agent/releases/download/${GLPI_VERSION}"
 TMP_DIR="/tmp/glpi-agent-install"
 CFG_FILE="/etc/glpi-agent/conf.d/00-install.cfg"
@@ -30,33 +31,56 @@ error_no_exit() { echo -e "${RED}[ERROR]${NC} $1"; }
 separador() { echo -e "${BLUE}────────────────────────────────────────────${NC}"; }
 
 # =============================================================================
-# VERIFICACIÓN DE PUERTO 80 (servidor GLPI)
+# VERIFICACIÓN DE PUERTO (helper genérico)
 # =============================================================================
-verificar_puerto_80() {
-    separador
-    info "Verificando acceso al puerto 80 del servidor GLPI..."
-
-    local host="glpi-service.mundopacifico.cl"
-
-    # Probamos conexión directa al puerto 80 usando /dev/tcp (bash puro, sin dependencias)
-    if timeout 5 bash -c "exec 3<>/dev/tcp/${host}/80" 2>/dev/null; then
+puerto_accesible() {
+    local puerto="$1"
+    if timeout 5 bash -c "exec 3<>/dev/tcp/${GLPI_HOST}/${puerto}" 2>/dev/null; then
         exec 3>&- 2>/dev/null || true
         exec 3<&- 2>/dev/null || true
-        ok "Puerto 80 accesible hacia ${host}."
         return 0
-    else
-        warn "El puerto 80 hacia ${host} está bloqueado o inaccesible."
-        return 1
     fi
+    return 1
 }
 
 # =============================================================================
-# LIMPIEZA / DESINSTALACIÓN EN CASO DE FALLO POR PUERTO 80
+# SELECCIÓN AUTOMÁTICA DE PROTOCOLO: HTTPS (443) preferido, HTTP (80) fallback
+# =============================================================================
+seleccionar_servidor() {
+    separador
+    info "Verificando conectividad hacia el servidor GLPI (${GLPI_HOST})..."
+
+    # Prioridad 1: HTTPS por 443 (más seguro y menos bloqueado en redes)
+    if puerto_accesible 443; then
+        GLPI_SERVER="https://${GLPI_HOST}/"
+        ok "Puerto 443 accesible. Se usará HTTPS: ${GLPI_SERVER}"
+        return 0
+    fi
+    warn "Puerto 443 no accesible. Probando puerto 80..."
+
+    # Prioridad 2: HTTP por 80
+    if puerto_accesible 80; then
+        GLPI_SERVER="http://${GLPI_HOST}/"
+        ok "Puerto 80 accesible. Se usará HTTP: ${GLPI_SERVER}"
+        return 0
+    fi
+
+    warn "Ningún puerto (443 ni 80) accesible hacia ${GLPI_HOST}."
+    return 1
+}
+
+# Verificación reutilizable post-instalación: ¿sigue habiendo algún puerto accesible?
+verificar_conectividad_glpi() {
+    puerto_accesible 443 || puerto_accesible 80
+}
+
+# =============================================================================
+# LIMPIEZA / DESINSTALACIÓN EN CASO DE FALLO DE CONECTIVIDAD
 # =============================================================================
 limpiar_por_puerto_bloqueado() {
     separador
-    error_no_exit "PUERTO 80 BLOQUEADO: no es posible contactar a ${GLPI_SERVER}"
-    warn "Esto generalmente se debe a un firewall corporativo o reglas de red que bloquean el puerto 80 (HTTP)."
+    error_no_exit "SIN CONECTIVIDAD: no es posible contactar a ${GLPI_HOST} ni por 443 (HTTPS) ni por 80 (HTTP)."
+    warn "Esto generalmente se debe a un firewall corporativo o reglas de red."
     warn "Se procederá a eliminar cualquier rastro de instalación para dejar el equipo limpio."
 
     info "Deteniendo servicio glpi-agent (si existe)..."
@@ -85,12 +109,12 @@ limpiar_por_puerto_bloqueado() {
 
     separador
     echo -e "${RED}"
-    echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║   INSTALACIÓN ABORTADA: PUERTO 80 BLOQUEADO   ║"
-    echo "  ╚══════════════════════════════════════════════╝"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    echo "  ║  INSTALACIÓN ABORTADA: SIN CONECTIVIDAD AL GLPI  ║"
+    echo "  ╚══════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo -e "  Solicita a la persona encargada de redes que habilite salida"
-    echo -e "  HTTP (puerto 80) hacia ${BLUE}glpi-service.mundopacifico.cl${NC} y vuelve a ejecutar el script."
+    echo -e "  HTTPS (443) o HTTP (80) hacia ${BLUE}${GLPI_HOST}${NC} y vuelve a ejecutar el script."
     separador
 
     exit 1
@@ -392,14 +416,6 @@ fi
 # Crear directorio temporal
 mkdir -p "${TMP_DIR}"
 
-# Conectividad con servidor GLPI
-info "Verificando conectividad con el servidor GLPI..."
-if curl -sf --max-time 5 "${GLPI_SERVER}" -o /dev/null; then
-    ok "Servidor GLPI accesible."
-else
-    warn "No se pudo verificar el servidor (puede ser normal antes del registro)."
-fi
-
 # Conectividad internet
 if ! curl -sf --max-time 10 "https://github.com" -o /dev/null; then
     error "Sin acceso a internet. Verifica la conexión."
@@ -409,7 +425,9 @@ ok "Conexión a internet verificada."
 # =============================================================================
 # FLUJO PRINCIPAL
 # =============================================================================
-verificar_puerto_80 || limpiar_por_puerto_bloqueado
+# Seleccionar protocolo automáticamente: HTTPS (443) preferido, HTTP (80) fallback.
+# Si ninguno está disponible, limpiar e informar.
+seleccionar_servidor || limpiar_por_puerto_bloqueado
 
 detectar_sistema
 elegir_metodo
@@ -444,13 +462,24 @@ else
         || error "El servicio no pudo iniciarse."
 fi
 
-# Verificar configuración
+# Verificar/corregir configuración del servidor
 info "Verificando configuración del servidor en ${CFG_FILE}..."
-if [[ -f "${CFG_FILE}" ]] && grep -q "glpi-service.mundopacifico.cl" "${CFG_FILE}"; then
-    ok "Servidor configurado correctamente."
-else
-    warn "No se encontró el servidor en la configuración. Verifica ${CFG_FILE}"
+
+# Detectar y eliminar configuraciones viejas apuntando al servidor antiguo (iplg)
+if grep -rq "iplg.mundopacifico.cl" /etc/glpi-agent/ 2>/dev/null; then
+    warn "Se detectó configuración apuntando al servidor GLPI antiguo (iplg). Corrigiendo..."
+    grep -rl "iplg.mundopacifico.cl" /etc/glpi-agent/ 2>/dev/null | while read -r archivo_viejo; do
+        sed -i "s|https\?://iplg.mundopacifico.cl[^\"' ]*|${GLPI_SERVER}|g" "${archivo_viejo}"
+    done
+    ok "Configuraciones antiguas corregidas hacia ${GLPI_SERVER}."
 fi
+
+# Asegurar que la configuración principal apunte al servidor correcto
+mkdir -p "$(dirname "${CFG_FILE}")"
+cat > "${CFG_FILE}" <<EOF
+server = ${GLPI_SERVER}
+EOF
+ok "Servidor configurado: ${GLPI_SERVER}"
 
 # Enviar inventario
 separador
@@ -459,9 +488,9 @@ if glpi-agent --server "${GLPI_SERVER}" --set-forcerun; then
     systemctl restart glpi-agent 2>/dev/null || true
     ok "Inventario forzado y servicio reiniciado para ejecutarlo de inmediato."
 else
-    warn "Falló el envío del inventario. Verificando si el puerto 80 sigue accesible..."
-    verificar_puerto_80 || limpiar_por_puerto_bloqueado
-    warn "El puerto 80 está accesible, pero hubo otra advertencia al enviar el inventario. Revisa los logs."
+    warn "Falló el envío del inventario. Verificando si el servidor sigue accesible..."
+    verificar_conectividad_glpi || limpiar_por_puerto_bloqueado
+    warn "El servidor está accesible, pero hubo otra advertencia al enviar el inventario. Revisa los logs."
 fi
 
 # =============================================================================
