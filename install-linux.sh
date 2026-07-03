@@ -385,13 +385,14 @@ instalar_deb() {
     ok "Paquete descargado."
 
     info "Instalando via apt-get (resuelve dependencias automáticamente)..."
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall \
         -o Dpkg::Options::="--force-confold" \
+        -o Dpkg::Options::="--force-confmiss" \
         "${deb_file}" 2>&1 | tee -a "${install_log}"; then
         ok "Instalación via .deb completada."
     else
         warn "apt-get falló. Intentando con dpkg + reparación de dependencias..."
-        DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold "${deb_file}" 2>&1 | tee -a "${install_log}" || true
+        DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold --force-confmiss "${deb_file}" 2>&1 | tee -a "${install_log}" || true
         DEBIAN_FRONTEND=noninteractive apt-get install -f -y 2>&1 | tee -a "${install_log}" || true
 
         if dpkg -l 2>/dev/null | grep -q "^ii[[:space:]]*glpi-agent"; then
@@ -474,6 +475,21 @@ instalar_appimage() {
 configurar_agente() {
     separador
     info "Aplicando configuración del agente..."
+
+    # Red de seguridad: si falta el archivo de configuración principal
+    # (caso real: dpkg no restaura conffiles borrados manualmente en el pasado),
+    # crearlo con el mínimo necesario para que el agente arranque y lea conf.d
+    if [[ ! -f /etc/glpi-agent/agent.cfg ]]; then
+        warn "Falta /etc/glpi-agent/agent.cfg (probable instalación previa dañada). Creándolo..."
+        mkdir -p /etc/glpi-agent/conf.d
+        cat > /etc/glpi-agent/agent.cfg <<'EOF'
+# Archivo de configuración principal de GLPI Agent
+# (regenerado por el script de instalación)
+# La configuración específica está en conf.d/
+include "conf.d/"
+EOF
+        ok "agent.cfg regenerado."
+    fi
 
     # Corregir configuraciones apuntando al servidor GLPI antiguo (iplg)
     if grep -rq "${SERVIDOR_VIEJO}" /etc/glpi-agent/ 2>/dev/null; then
