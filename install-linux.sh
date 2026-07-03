@@ -1,11 +1,21 @@
 #!/bin/bash
 # =============================================================================
-# Script universal de instalación de GLPI Agent v1.17
+# Script universal de instalación de GLPI Agent v1.17 — LINUX
 # Compatible con: Ubuntu, Debian, RHEL, CentOS, Rocky, Alma, Fedora, etc.
-# Servidor: http://glpi-service.mundopacifico.cl/
+# Servidor: glpi-service.mundopacifico.cl (HTTPS preferido, HTTP fallback)
+#
+# Características:
+#  - Selección automática de protocolo: 443 (HTTPS) → 80 (HTTP)
+#  - Detección y corrección automática de DNS incorrecto (vía /etc/hosts)
+#  - Purga de instalaciones previas conflictivas (paquetes de distro)
+#  - Corrección de configuraciones apuntando al servidor antiguo (iplg)
+#  - Manejo de locks de dpkg / unattended-upgrades sin colgarse
+#  - Instalación 100% silenciosa (sin diálogos PAM ni debconf)
+#  - Log completo de toda la ejecución para diagnóstico
+#  - Limpieza total del equipo si no hay conectividad con el servidor
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail   # (sin -e: los errores se manejan explícitamente)
 
 # --- Colores ---
 RED='\033[0;31m'
@@ -17,10 +27,13 @@ NC='\033[0m'
 # --- Variables ---
 GLPI_VERSION="1.17"
 GLPI_HOST="glpi-service.mundopacifico.cl"
-GLPI_SERVER=""   # se define automáticamente según el puerto disponible (443 u 80)
+GLPI_IP="172.16.2.55"          # IP interna conocida del servidor (fallback si el DNS falla)
+GLPI_SERVER=""                 # se define automáticamente (https:// o http://)
+SERVIDOR_VIEJO="iplg.mundopacifico.cl"
 BASE_URL="https://github.com/glpi-project/glpi-agent/releases/download/${GLPI_VERSION}"
 TMP_DIR="/tmp/glpi-agent-install"
 CFG_FILE="/etc/glpi-agent/conf.d/00-install.cfg"
+SCRIPT_LOG="${TMP_DIR}/instalacion-completa.log"
 
 # --- Funciones de log ---
 info()      { echo -e "${BLUE}[INFO]${NC}  $1"; }
@@ -31,11 +44,11 @@ error_no_exit() { echo -e "${RED}[ERROR]${NC} $1"; }
 separador() { echo -e "${BLUE}────────────────────────────────────────────${NC}"; }
 
 # =============================================================================
-# VERIFICACIÓN DE PUERTO (helper genérico)
+# HELPERS DE CONECTIVIDAD
 # =============================================================================
 puerto_accesible() {
-    local puerto="$1"
-    if timeout 5 bash -c "exec 3<>/dev/tcp/${GLPI_HOST}/${puerto}" 2>/dev/null; then
+    # $1 = host o IP, $2 = puerto
+    if timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then
         exec 3>&- 2>/dev/null || true
         exec 3<&- 2>/dev/null || true
         return 0
@@ -44,34 +57,82 @@ puerto_accesible() {
 }
 
 # =============================================================================
-# SELECCIÓN AUTOMÁTICA DE PROTOCOLO: HTTPS (443) preferido, HTTP (80) fallback
+# CORRECCIÓN AUTOMÁTICA DE DNS (vía /etc/hosts)
+# Caso real detectado: equipos con doble interfaz (cable corporativo + WiFi
+# externo) resuelven el dominio con un DNS equivocado hacia una IP pública
+# inalcanzable, cuando el servidor real está en la IP interna.
+# =============================================================================
+corregir_dns_hosts() {
+    warn "El nombre ${GLPI_HOST} no es alcanzable, pero la IP interna ${GLPI_IP} sí."
+    warn "Esto indica un problema de DNS (típico en equipos con doble red: cable + WiFi)."
+    info "Fijando la resolución correcta en /etc/hosts..."
+
+    # Eliminar entradas previas del host para evitar duplicados o valores viejos
+    sed -i "/[[:space:]]${GLPI_HOST}[[:space:]]*$/d" /etc/hosts 2>/dev/null || true
+    sed -i "/[[:space:]]${GLPI_HOST}$/d" /etc/hosts 2>/dev/null || true
+
+    echo "${GLPI_IP}  ${GLPI_HOST}" >> /etc/hosts
+
+    # Verificar que ahora resuelve bien
+    if getent hosts "${GLPI_HOST}" | grep -q "${GLPI_IP}"; then
+        ok "DNS corregido: ${GLPI_HOST} → ${GLPI_IP} (vía /etc/hosts)."
+        return 0
+    else
+        warn "No se pudo verificar la corrección de DNS."
+        return 1
+    fi
+}
+
+# =============================================================================
+# SELECCIÓN AUTOMÁTICA DE PROTOCOLO Y CORRECCIÓN DE DNS
+# Orden de decisión:
+#   1. hostname:443 → HTTPS
+#   2. hostname:80  → HTTP
+#   3. IP:443 o IP:80 → problema de DNS → corregir /etc/hosts → reintentar
+#   4. nada responde → sin conectividad real → limpiar e informar
 # =============================================================================
 seleccionar_servidor() {
     separador
     info "Verificando conectividad hacia el servidor GLPI (${GLPI_HOST})..."
 
-    # Prioridad 1: HTTPS por 443 (más seguro y menos bloqueado en redes)
-    if puerto_accesible 443; then
+    # Intento 1: por nombre
+    if puerto_accesible "${GLPI_HOST}" 443; then
         GLPI_SERVER="https://${GLPI_HOST}/"
         ok "Puerto 443 accesible. Se usará HTTPS: ${GLPI_SERVER}"
         return 0
     fi
-    warn "Puerto 443 no accesible. Probando puerto 80..."
-
-    # Prioridad 2: HTTP por 80
-    if puerto_accesible 80; then
+    if puerto_accesible "${GLPI_HOST}" 80; then
         GLPI_SERVER="http://${GLPI_HOST}/"
         ok "Puerto 80 accesible. Se usará HTTP: ${GLPI_SERVER}"
         return 0
     fi
 
-    warn "Ningún puerto (443 ni 80) accesible hacia ${GLPI_HOST}."
+    warn "El nombre ${GLPI_HOST} no responde en 443 ni 80. Probando la IP interna ${GLPI_IP}..."
+
+    # Intento 2: por IP interna (detecta problema de DNS)
+    if puerto_accesible "${GLPI_IP}" 443 || puerto_accesible "${GLPI_IP}" 80; then
+        corregir_dns_hosts || true
+
+        # Reintentar por nombre tras la corrección
+        if puerto_accesible "${GLPI_HOST}" 443; then
+            GLPI_SERVER="https://${GLPI_HOST}/"
+            ok "Puerto 443 accesible tras corrección DNS. Se usará HTTPS: ${GLPI_SERVER}"
+            return 0
+        fi
+        if puerto_accesible "${GLPI_HOST}" 80; then
+            GLPI_SERVER="http://${GLPI_HOST}/"
+            ok "Puerto 80 accesible tras corrección DNS. Se usará HTTP: ${GLPI_SERVER}"
+            return 0
+        fi
+    fi
+
+    warn "Sin conectividad hacia ${GLPI_HOST} (ni por nombre ni por IP interna)."
     return 1
 }
 
-# Verificación reutilizable post-instalación: ¿sigue habiendo algún puerto accesible?
+# Verificación reutilizable post-instalación
 verificar_conectividad_glpi() {
-    puerto_accesible 443 || puerto_accesible 80
+    puerto_accesible "${GLPI_HOST}" 443 || puerto_accesible "${GLPI_HOST}" 80
 }
 
 # =============================================================================
@@ -83,13 +144,20 @@ limpiar_por_puerto_bloqueado() {
     warn "Esto generalmente se debe a un firewall corporativo o reglas de red."
     warn "Se procederá a eliminar cualquier rastro de instalación para dejar el equipo limpio."
 
+    # Datos de red del equipo, útiles para el ticket al área de redes
+    separador
+    info "Datos de red de este equipo (adjúntalos al solicitar la regla de firewall):"
+    ip addr 2>/dev/null | grep "inet " | grep -v 127.0.0.1 || true
+    ip route 2>/dev/null | head -3 || true
+    separador
+
     info "Deteniendo servicio glpi-agent (si existe)..."
     systemctl stop glpi-agent 2>/dev/null || true
     systemctl disable glpi-agent 2>/dev/null || true
 
     info "Eliminando paquete glpi-agent (si fue instalado)..."
     if command -v apt-get &>/dev/null; then
-        apt-get remove -y --purge glpi-agent 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y --purge glpi-agent 2>/dev/null || true
     fi
     if command -v yum &>/dev/null; then
         yum remove -y glpi-agent 2>/dev/null || true
@@ -114,7 +182,8 @@ limpiar_por_puerto_bloqueado() {
     echo "  ╚══════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo -e "  Solicita a la persona encargada de redes que habilite salida"
-    echo -e "  HTTPS (443) o HTTP (80) hacia ${BLUE}${GLPI_HOST}${NC} y vuelve a ejecutar el script."
+    echo -e "  HTTPS (443) o HTTP (80) hacia ${BLUE}${GLPI_HOST}${NC} (${GLPI_IP})"
+    echo -e "  desde la red de este equipo, y vuelve a ejecutar el script."
     separador
 
     exit 1
@@ -141,7 +210,6 @@ detectar_sistema() {
         error "No se pudo detectar el sistema operativo (/etc/os-release no encontrado)."
     fi
 
-    # Determinar familia
     case "${OS_ID}" in
         ubuntu|debian|linuxmint|pop|kali|raspbian)
             OS_FAMILY="deb" ;;
@@ -160,21 +228,15 @@ detectar_sistema() {
 # DETECCIÓN DE DISTROS EOL (sin repositorios activos)
 # =============================================================================
 es_eol() {
-    # Ubuntu EOL conocidas
-    EOL_UBUNTU=("14.04" "16.04" "18.10" "19.04" "19.10" "20.10" "21.04" "21.10" "22.10" "23.04" "23.10")
+    EOL_UBUNTU=("14.04" "16.04" "18.04" "18.10" "19.04" "19.10" "20.10" "21.04" "21.10" "22.10" "23.04" "23.10")
     if [[ "${OS_ID}" == "ubuntu" ]]; then
         for v in "${EOL_UBUNTU[@]}"; do
-            if [[ "${OS_VERSION}" == "$v" ]]; then
-                return 0
-            fi
+            [[ "${OS_VERSION}" == "$v" ]] && return 0
         done
     fi
-
-    # CentOS 8 y anteriores también son EOL
-    if [[ "${OS_ID}" == "centos" && "${OS_VERSION}" -le 8 ]] 2>/dev/null; then
+    if [[ "${OS_ID}" == "centos" ]] && [[ "${OS_VERSION%%.*}" -le 8 ]] 2>/dev/null; then
         return 0
     fi
-
     return 1
 }
 
@@ -186,14 +248,23 @@ elegir_metodo() {
     info "Determinando método de instalación óptimo..."
 
     if [[ "${ARCH}" != "x86_64" ]]; then
-        warn "Arquitectura ${ARCH} detectada. Solo el instalador Perl es compatible."
-        METODO="perl"
+        warn "Arquitectura ${ARCH} detectada. Usando AppImage no es posible; se usará el paquete correspondiente si existe."
+        # El .deb oficial es 'all' (independiente de arquitectura), sirve en ARM también si hay perl
+        if [[ "${OS_FAMILY}" == "deb" ]]; then
+            METODO="deb"
+        elif [[ "${OS_FAMILY}" == "rpm" ]]; then
+            METODO="rpm"
+        else
+            error "Arquitectura ${ARCH} con distro desconocida: instalación no soportada automáticamente."
+        fi
+        ok "Método seleccionado: ${METODO}"
         return
     fi
 
     if es_eol; then
         warn "Distro EOL detectada (${OS_NAME}). Usando AppImage para evitar problemas de dependencias."
         METODO="appimage"
+        ok "Método seleccionado: ${METODO}"
         return
     fi
 
@@ -216,158 +287,128 @@ elegir_metodo() {
 }
 
 # =============================================================================
-# INSTALACIÓN VIA APPIMAGE
-# =============================================================================
-instalar_appimage() {
-    info "Descargando AppImage (autocontenido, sin dependencias)..."
-    local url="${BASE_URL}/glpi-agent-${GLPI_VERSION}-x86_64.AppImage"
-    local dest="${TMP_DIR}/glpi-agent.AppImage"
-
-    curl -fL --progress-bar "${url}" -o "${dest}" \
-        || error "Falló la descarga del AppImage."
-
-    chmod +x "${dest}"
-    ok "AppImage descargado."
-
-    info "Instalando via AppImage..."
-    "${dest}" --install --server "${GLPI_SERVER}" --runnow \
-        || error "Falló la instalación via AppImage."
-}
-
-# =============================================================================
 # LIMPIEZA DE INSTALACIONES PREVIAS CONFLICTIVAS
+# (ej: glpi-agent 1.4 del repositorio genérico de Ubuntu)
 # =============================================================================
-# Algunos equipos tienen glpi-agent instalado desde el repositorio genérico
-# de la distro (ej. Ubuntu universe, versión 1.4 u otra antigua), lo que
-# choca con el instalador oficial 1.17 y hace fallar la instalación con un
-# mensaje genérico "Failed to install glpi-agent".
 limpiar_instalacion_previa_conflictiva() {
     local version_instalada=""
 
-    if [[ "${OS_FAMILY}" == "deb" ]] && command -v dpkg &>/dev/null; then
+    if command -v dpkg &>/dev/null; then
         version_instalada=$(dpkg -l 2>/dev/null | awk '/^ii[[:space:]]+glpi-agent[[:space:]]/ {print $3}')
-    elif [[ "${OS_FAMILY}" == "rpm" ]] && command -v rpm &>/dev/null; then
-        version_instalada=$(rpm -q --qf '%{VERSION}' glpi-agent 2>/dev/null || true)
+    elif command -v rpm &>/dev/null; then
+        version_instalada=$(rpm -q --qf '%{VERSION}' glpi-agent 2>/dev/null | grep -v "not installed" || true)
     fi
 
     if [[ -n "${version_instalada}" ]]; then
-        warn "Se detectó una instalación previa de glpi-agent (versión: ${version_instalada}), distinta a la oficial ${GLPI_VERSION}."
-        warn "Esto suele venir del repositorio estándar de la distro y choca con el instalador oficial. Purgando..."
+        if [[ "${version_instalada}" == *"${GLPI_VERSION}"* ]]; then
+            info "GLPI Agent ${GLPI_VERSION} ya se encuentra instalado. Se reinstalará/reconfigurará sobre él."
+            return 0
+        fi
+
+        warn "Instalación previa de glpi-agent detectada (versión: ${version_instalada}), distinta a la oficial ${GLPI_VERSION}."
+        warn "Purgando para evitar conflictos..."
 
         systemctl stop glpi-agent 2>/dev/null || true
 
-        if [[ "${OS_FAMILY}" == "deb" ]]; then
-            apt-get remove --purge -y glpi-agent 2>/dev/null || true
-            apt-get autoremove -y 2>/dev/null || true
-        elif [[ "${OS_FAMILY}" == "rpm" ]]; then
-            yum remove -y glpi-agent 2>/dev/null || dnf remove -y glpi-agent 2>/dev/null || true
+        if command -v apt-get &>/dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y glpi-agent 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true
+        elif command -v yum &>/dev/null; then
+            yum remove -y glpi-agent 2>/dev/null || true
+        elif command -v dnf &>/dev/null; then
+            dnf remove -y glpi-agent 2>/dev/null || true
         fi
 
         rm -rf /etc/glpi-agent /var/lib/glpi-agent
 
-        ok "Instalación previa eliminada. Continuando con la instalación oficial ${GLPI_VERSION}."
+        ok "Instalación previa eliminada."
     fi
 }
 
 # =============================================================================
+# LIBERACIÓN DE DPKG (unattended-upgrades y locks)
+# =============================================================================
+liberar_dpkg() {
+    info "Liberando dpkg de actualizaciones automáticas y locks..."
+
+    # Matar procesos que puedan tener el lock, sin esperar shutdowns graceful
+    pkill -9 -f "unattended-upgr" 2>/dev/null || true
+
+    # Detener servicios con timeout para no colgarse jamás
+    timeout 5 systemctl stop unattended-upgrades 2>/dev/null || true
+    timeout 5 systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+
+    # Matar cualquier proceso restante que tenga algún lock tomado
+    local lock_file pid
+    for lock_file in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
+        if [[ -f "${lock_file}" ]]; then
+            pid=$(fuser "${lock_file}" 2>/dev/null | tr -d ' ' || true)
+            if [[ -n "${pid}" ]]; then
+                kill -9 ${pid} 2>/dev/null || true
+            fi
+        fi
+    done
+    sleep 2
+
+    # Eliminar archivos de lock residuales
+    rm -f /var/lib/dpkg/lock-frontend \
+          /var/lib/dpkg/lock \
+          /var/cache/apt/archives/lock 2>/dev/null || true
+
+    # Reparar posibles estados a medias de dpkg
+    dpkg --configure -a 2>/dev/null || true
+
+    ok "dpkg disponible."
+}
+
+# =============================================================================
 # INSTALACIÓN VIA .DEB DIRECTO (Ubuntu/Debian)
-# Más confiable que el instalador Perl: apt-get resuelve dependencias
-# automáticamente y no tiene conflictos con paquetes previos del sistema.
 # =============================================================================
 instalar_deb() {
     local install_log="${TMP_DIR}/deb-install.log"
     local deb_file="${TMP_DIR}/glpi-agent.deb"
     local url="${BASE_URL}/glpi-agent_${GLPI_VERSION}-1_all.deb"
 
-    # Forzar modo completamente silencioso: ningún paquete puede lanzar
-    # diálogos interactivos (como el de PAM), sin importar lo que pida.
+    # Modo 100% silencioso: ningún paquete puede lanzar diálogos (PAM, debconf, etc.)
     export DEBIAN_FRONTEND=noninteractive
     export DEBCONF_NONINTERACTIVE_SEEN=true
-    export UCF_FORCE_CONFFOLD=1  # conservar archivos locales si hay conflicto
+    export UCF_FORCE_CONFFOLD=1
 
-    # Detener unattended-upgrades ANTES de cualquier operación dpkg.
-    info "Deteniendo actualizaciones automáticas para liberar dpkg..."
-
-    # Matar directamente por PID sin esperar graceful shutdown (evita colgarse)
-    for proc in unattended-upgr apt-get dpkg; do
-        pkill -9 -f "${proc}" 2>/dev/null || true
-    done
-    timeout 5 systemctl stop unattended-upgrades 2>/dev/null || true
-    timeout 5 systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-
-    # Matar cualquier proceso que aún tenga algún lock tomado
-    for lock_file in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
-        if [[ -f "${lock_file}" ]]; then
-            local pid
-            pid=$(fuser "${lock_file}" 2>/dev/null || true)
-            if [[ -n "${pid}" ]]; then
-                kill -9 "${pid}" 2>/dev/null || true
-            fi
-        fi
-    done
-    sleep 2
-
-    # Eliminar los archivos de lock directamente
-    rm -f /var/lib/dpkg/lock-frontend \
-          /var/lib/dpkg/lock \
-          /var/cache/apt/archives/lock \
-          /var/cache/debconf/config.dat-old 2>/dev/null || true
-
-    ok "dpkg disponible."
-
-    # Limpiar cualquier instalación previa conflictiva
+    liberar_dpkg
     limpiar_instalacion_previa_conflictiva
 
-    # Reparar posibles estados rotos de dpkg antes de instalar
-    info "Verificando estado de dpkg..."
-    dpkg --configure -a 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -f -y 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -f -y >>"${install_log}" 2>&1 || true
 
     info "Descargando paquete .deb oficial de GLPI Agent..."
-    curl -fL --progress-bar "${url}" -o "${deb_file}" \
-        || error "Falló la descarga del paquete .deb."
+    curl -fL --retry 3 --retry-delay 3 --progress-bar "${url}" -o "${deb_file}" \
+        || error "Falló la descarga del paquete .deb (verifica acceso a github.com)."
     ok "Paquete descargado."
 
     info "Instalando via apt-get (resuelve dependencias automáticamente)..."
-    # Preconfigurar debconf para evitar cualquier diálogo interactivo
-    # (como el de PAM preguntando si sobreescribir archivos locales)
-    echo 'libpam-runtime libpam-runtime/override boolean false' | debconf-set-selections 2>/dev/null || true
-    echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections 2>/dev/null || true
-
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y "${deb_file}" 2>&1 | tee "${install_log}"; then
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confold" \
+        "${deb_file}" 2>&1 | tee -a "${install_log}"; then
         ok "Instalación via .deb completada."
     else
-        echo ""
-        warn "Instalación via apt-get falló. Intentando con dpkg + fix de dependencias..."
-        separador
-        DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true dpkg -i "${deb_file}" 2>&1 | tee -a "${install_log}" || true
+        warn "apt-get falló. Intentando con dpkg + reparación de dependencias..."
+        DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold "${deb_file}" 2>&1 | tee -a "${install_log}" || true
         DEBIAN_FRONTEND=noninteractive apt-get install -f -y 2>&1 | tee -a "${install_log}" || true
-        separador
 
-        # Verificar si quedó instalado a pesar del error
         if dpkg -l 2>/dev/null | grep -q "^ii[[:space:]]*glpi-agent"; then
             ok "GLPI Agent instalado correctamente (via dpkg + fix de dependencias)."
         else
             warn "Detalle del error (últimas 20 líneas):"
             separador
-            tail -n 20 "${install_log}" || true
+            tail -n 20 "${install_log}" 2>/dev/null || true
             separador
-            warn "Log completo disponible en: ${install_log} (no se eliminará para diagnóstico)"
-            error "Falló la instalación del paquete .deb. Revisa el detalle de arriba."
+            warn "Log completo: ${install_log} (no se eliminará para diagnóstico)"
+            error "Falló la instalación del paquete .deb."
         fi
     fi
-
-    # Aplicar configuración del servidor GLPI
-    info "Aplicando configuración del servidor GLPI..."
-    mkdir -p /etc/glpi-agent/conf.d
-    cat > /etc/glpi-agent/conf.d/00-install.cfg <<EOF
-server = ${GLPI_SERVER}
-EOF
-    ok "Configuración aplicada."
 }
 
 # =============================================================================
-# INSTALACIÓN VIA INSTALADOR PERL (solo para RPM: RHEL, CentOS, Rocky, etc.)
+# INSTALACIÓN VIA INSTALADOR PERL (RHEL, CentOS, Rocky, Alma, Fedora)
 # =============================================================================
 instalar_perl_rpm() {
     if ! command -v perl &>/dev/null; then
@@ -381,25 +422,135 @@ instalar_perl_rpm() {
     info "Descargando instalador Perl oficial..."
     local url="${BASE_URL}/glpi-agent-${GLPI_VERSION}-linux-installer.pl"
     local dest="${TMP_DIR}/glpi-install.pl"
-
-    curl -fL --progress-bar "${url}" -o "${dest}" \
-        || error "Falló la descarga del instalador Perl."
-
-    ok "Instalador descargado."
-    info "Instalando via Perl (RPM)..."
-
     local install_log="${TMP_DIR}/perl-install.log"
 
-    if perl "${dest}" --install --server "${GLPI_SERVER}" --runnow 2>&1 | tee "${install_log}"; then
+    curl -fL --retry 3 --retry-delay 3 --progress-bar "${url}" -o "${dest}" \
+        || error "Falló la descarga del instalador Perl."
+    ok "Instalador descargado."
+
+    info "Instalando via Perl (RPM)..."
+    if perl "${dest}" --install --server "${GLPI_SERVER}" 2>&1 | tee "${install_log}"; then
         ok "Instalación via Perl completada."
     else
-        warn "La instalación via Perl falló. Detalle del error (últimas 20 líneas):"
+        warn "Detalle del error (últimas 20 líneas):"
         separador
-        tail -n 20 "${install_log}" || true
+        tail -n 20 "${install_log}" 2>/dev/null || true
         separador
-        warn "Log completo disponible en: ${install_log} (no se eliminará para diagnóstico)"
-        error "Falló la instalación via Perl. Revisa el detalle de arriba."
+        warn "Log completo: ${install_log} (no se eliminará para diagnóstico)"
+        error "Falló la instalación via Perl."
     fi
+}
+
+# =============================================================================
+# INSTALACIÓN VIA APPIMAGE (distros EOL o desconocidas)
+# =============================================================================
+instalar_appimage() {
+    info "Descargando AppImage (autocontenido, sin dependencias)..."
+    local url="${BASE_URL}/glpi-agent-${GLPI_VERSION}-x86_64.AppImage"
+    local dest="${TMP_DIR}/glpi-agent.AppImage"
+    local install_log="${TMP_DIR}/appimage-install.log"
+
+    curl -fL --retry 3 --retry-delay 3 --progress-bar "${url}" -o "${dest}" \
+        || error "Falló la descarga del AppImage."
+
+    chmod +x "${dest}"
+    ok "AppImage descargado."
+
+    info "Instalando via AppImage..."
+    if "${dest}" --install --server "${GLPI_SERVER}" 2>&1 | tee "${install_log}"; then
+        ok "Instalación via AppImage completada."
+    else
+        warn "Detalle del error (últimas 20 líneas):"
+        separador
+        tail -n 20 "${install_log}" 2>/dev/null || true
+        separador
+        error "Falló la instalación via AppImage."
+    fi
+}
+
+# =============================================================================
+# CONFIGURACIÓN POST-INSTALACIÓN
+# =============================================================================
+configurar_agente() {
+    separador
+    info "Aplicando configuración del agente..."
+
+    # Corregir configuraciones apuntando al servidor GLPI antiguo (iplg)
+    if grep -rq "${SERVIDOR_VIEJO}" /etc/glpi-agent/ 2>/dev/null; then
+        warn "Se detectó configuración apuntando al servidor antiguo (${SERVIDOR_VIEJO}). Corrigiendo..."
+        grep -rl "${SERVIDOR_VIEJO}" /etc/glpi-agent/ 2>/dev/null | while read -r archivo_viejo; do
+            sed -i "s|https\?://${SERVIDOR_VIEJO}[^\"' ]*|${GLPI_SERVER}|g" "${archivo_viejo}"
+        done
+        ok "Configuraciones antiguas corregidas."
+    fi
+
+    # Configuración principal: servidor + trust localhost (permite forzar
+    # inventario desde http://localhost:62354/now sin token)
+    mkdir -p "$(dirname "${CFG_FILE}")"
+    cat > "${CFG_FILE}" <<EOF
+server = ${GLPI_SERVER}
+httpd-trust = 127.0.0.1
+EOF
+    ok "Servidor configurado: ${GLPI_SERVER}"
+}
+
+# =============================================================================
+# VERIFICACIÓN DEL SERVICIO
+# =============================================================================
+verificar_servicio() {
+    separador
+    info "Verificando estado del servicio glpi-agent..."
+
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable glpi-agent 2>/dev/null || true
+    systemctl restart glpi-agent 2>/dev/null || true
+    sleep 3
+
+    if systemctl is-active --quiet glpi-agent; then
+        ok "Servicio glpi-agent ACTIVO."
+        return 0
+    fi
+
+    warn "Servicio no activo. Intentando iniciar..."
+    systemctl start glpi-agent 2>/dev/null || true
+    sleep 3
+
+    if systemctl is-active --quiet glpi-agent; then
+        ok "Servicio iniciado correctamente."
+        return 0
+    fi
+
+    warn "El servicio no pudo iniciarse. Últimas líneas del log del servicio:"
+    separador
+    journalctl -u glpi-agent -n 15 --no-pager 2>/dev/null || true
+    separador
+    error "El servicio glpi-agent no pudo iniciarse. Revisa el log de arriba."
+}
+
+# =============================================================================
+# ENVÍO DE INVENTARIO INICIAL
+# =============================================================================
+enviar_inventario() {
+    separador
+    info "Forzando envío de inventario inicial al servidor..."
+
+    # Método 1: endpoint local /now (actúa sobre el agente ya corriendo)
+    sleep 2
+    if curl -sf --max-time 10 "http://127.0.0.1:62354/now" -o /dev/null 2>/dev/null; then
+        ok "Inventario forzado via endpoint local (127.0.0.1:62354/now)."
+        return 0
+    fi
+
+    # Método 2: set-forcerun + restart
+    if glpi-agent --server "${GLPI_SERVER}" --set-forcerun 2>/dev/null; then
+        systemctl restart glpi-agent 2>/dev/null || true
+        ok "Inventario forzado via set-forcerun (se enviará al reiniciar el servicio)."
+        return 0
+    fi
+
+    warn "No se pudo forzar el inventario inmediato. Verificando conectividad..."
+    verificar_conectividad_glpi || limpiar_por_puerto_bloqueado
+    warn "El servidor está accesible; el agente enviará el inventario en su próximo ciclo programado."
 }
 
 # =============================================================================
@@ -413,20 +564,22 @@ if [[ $EUID -ne 0 ]]; then
     error "Ejecuta el script como root: sudo $0"
 fi
 
-# Crear directorio temporal
+# Directorio temporal + log completo de ejecución
 mkdir -p "${TMP_DIR}"
+exec > >(tee -a "${SCRIPT_LOG}") 2>&1
 
-# Conectividad internet
+# Herramientas mínimas
+command -v curl &>/dev/null || error "curl no está instalado. Instálalo primero (apt install curl / yum install curl)."
+
+# Conectividad a GitHub (necesaria para descargar el instalador)
 if ! curl -sf --max-time 10 "https://github.com" -o /dev/null; then
-    error "Sin acceso a internet. Verifica la conexión."
+    error "Sin acceso a github.com (necesario para descargar el instalador). Verifica la conexión a internet."
 fi
 ok "Conexión a internet verificada."
 
 # =============================================================================
 # FLUJO PRINCIPAL
 # =============================================================================
-# Seleccionar protocolo automáticamente: HTTPS (443) preferido, HTTP (80) fallback.
-# Si ninguno está disponible, limpiar e informar.
 seleccionar_servidor || limpiar_por_puerto_bloqueado
 
 detectar_sistema
@@ -444,54 +597,9 @@ esac
 
 ok "Instalación completada."
 
-# =============================================================================
-# VERIFICACIÓN DEL SERVICIO
-# =============================================================================
-separador
-info "Verificando estado del servicio glpi-agent..."
-sleep 3
-
-if systemctl is-active --quiet glpi-agent; then
-    ok "Servicio glpi-agent ACTIVO."
-else
-    warn "Servicio no activo. Intentando iniciar..."
-    systemctl start glpi-agent || error "No se pudo iniciar el servicio. Revisa: journalctl -u glpi-agent -n 50"
-    sleep 2
-    systemctl is-active --quiet glpi-agent \
-        && ok "Servicio iniciado correctamente." \
-        || error "El servicio no pudo iniciarse."
-fi
-
-# Verificar/corregir configuración del servidor
-info "Verificando configuración del servidor en ${CFG_FILE}..."
-
-# Detectar y eliminar configuraciones viejas apuntando al servidor antiguo (iplg)
-if grep -rq "iplg.mundopacifico.cl" /etc/glpi-agent/ 2>/dev/null; then
-    warn "Se detectó configuración apuntando al servidor GLPI antiguo (iplg). Corrigiendo..."
-    grep -rl "iplg.mundopacifico.cl" /etc/glpi-agent/ 2>/dev/null | while read -r archivo_viejo; do
-        sed -i "s|https\?://iplg.mundopacifico.cl[^\"' ]*|${GLPI_SERVER}|g" "${archivo_viejo}"
-    done
-    ok "Configuraciones antiguas corregidas hacia ${GLPI_SERVER}."
-fi
-
-# Asegurar que la configuración principal apunte al servidor correcto
-mkdir -p "$(dirname "${CFG_FILE}")"
-cat > "${CFG_FILE}" <<EOF
-server = ${GLPI_SERVER}
-EOF
-ok "Servidor configurado: ${GLPI_SERVER}"
-
-# Enviar inventario
-separador
-info "Enviando inventario inicial al servidor..."
-if glpi-agent --server "${GLPI_SERVER}" --set-forcerun; then
-    systemctl restart glpi-agent 2>/dev/null || true
-    ok "Inventario forzado y servicio reiniciado para ejecutarlo de inmediato."
-else
-    warn "Falló el envío del inventario. Verificando si el servidor sigue accesible..."
-    verificar_conectividad_glpi || limpiar_por_puerto_bloqueado
-    warn "El servidor está accesible, pero hubo otra advertencia al enviar el inventario. Revisa los logs."
-fi
+configurar_agente
+verificar_servicio
+enviar_inventario
 
 # =============================================================================
 # RESUMEN FINAL
@@ -506,15 +614,15 @@ echo -e "  ${BLUE}Sistema:${NC}   ${OS_NAME}"
 echo -e "  ${BLUE}Método:${NC}    ${METODO}"
 echo -e "  ${BLUE}Servidor:${NC}  ${GLPI_SERVER}"
 echo -e "  ${BLUE}Versión:${NC}   ${GLPI_VERSION}"
-echo -e "  ${BLUE}Servicio:${NC}  $(systemctl is-active glpi-agent)"
+echo -e "  ${BLUE}Servicio:${NC}  $(systemctl is-active glpi-agent 2>/dev/null)"
 echo ""
 echo -e "  Comandos útiles:"
-echo -e "  ${YELLOW}systemctl status glpi-agent${NC}     → Estado del servicio"
-echo -e "  ${YELLOW}systemctl restart glpi-agent${NC}    → Reiniciar el agente"
-echo -e "  ${YELLOW}glpi-agent --set-forcerun${NC}       → Forzar inventario en próximo arranque"
-echo -e "  ${YELLOW}journalctl -u glpi-agent -f${NC}     → Logs en tiempo real"
+echo -e "  ${YELLOW}systemctl status glpi-agent${NC}          → Estado del servicio"
+echo -e "  ${YELLOW}systemctl restart glpi-agent${NC}         → Reiniciar el agente"
+echo -e "  ${YELLOW}curl http://127.0.0.1:62354/now${NC}      → Forzar inventario inmediato"
+echo -e "  ${YELLOW}journalctl -u glpi-agent -f${NC}          → Logs en tiempo real"
 separador
 
-# Limpieza
+# Limpieza (solo en éxito; en fallo los logs quedan en TMP_DIR para diagnóstico)
 rm -rf "${TMP_DIR}"
 info "Archivos temporales eliminados."
